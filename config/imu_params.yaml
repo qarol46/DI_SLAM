@@ -5,16 +5,10 @@ imu_preintegration_node:
     
     # Шумы IMU (подберите под ваш сенсор!)
     # Для MPU6050:
-    sigma_g: 0.0034       # rad/s/sqrt(s)
-    sigma_a: 0.07         # m/s^2/sqrt(s)
-    sigma_bg: 0.00005     # rad/s^2/sqrt(s)
+    sigma_g: 0.004      # rad/s/sqrt(s)
+    sigma_a: 0.08         # m/s^2/sqrt(s)
+    sigma_bg: 0.0002     # rad/s^2/sqrt(s)
     sigma_ba: 0.002       # m/s^3/sqrt(s)
-    
-    # Для более точного IMU (например, ADIS16470):
-    # sigma_g: 0.0002
-    # sigma_a: 0.005
-    # sigma_bg: 0.00001
-    # sigma_ba: 0.0001
     
     # Вывод данных
     output_directory: "/tmp/imu_test"
