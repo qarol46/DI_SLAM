@@ -1,360 +1,259 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
-#include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
-#include <gtsam/navigation/ImuFactor.h>
-#include <gtsam/navigation/PreintegratedImuMeasurements.h>
 #include <Eigen/Dense>
-#include <fstream>
-#include <chrono>
-#include <filesystem>
+#include <Eigen/Geometry>
+#include <deque>
 
-class ImuPreintegrationNode : public rclcpp::Node {
+class ImuEigenNode : public rclcpp::Node {
 private:
-    // Подписки и публикаторы
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocity_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr covariance_pub_;
-    
-    // TF broadcaster
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+    // Состояние системы
+    Eigen::Vector3d position_;
+    Eigen::Vector3d velocity_;
+    Eigen::Quaterniond orientation_;
     
-    // Сервисы
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_srv_;
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr export_srv_;
+    // Bias акселерометра (только акселерометра, без гравитации)
+    Eigen::Vector3d accel_bias_;
     
-    // GTSAM объекты
-    gtsam::PreintegratedImuMeasurements::shared_ptr preintegrated_;
-    gtsam::imuBias::ConstantBias current_bias_;
-    
-    // Состояние
-    double last_imu_time_;
+    // Для оценки bias
+    std::deque<Eigen::Vector3d> accel_buffer_;
+    std::deque<Eigen::Quaterniond> orientation_buffer_;
+    bool bias_initialized_;
     double start_time_;
-    bool first_imu_received_;
-    int measurement_count_;
+    
+    double last_time_;
+    bool first_message_;
     
     // Параметры
     double gravity_;
-    double sigma_g_, sigma_a_, sigma_bg_, sigma_ba_;
-    std::string output_directory_;
-    bool export_enabled_;
-    
-    // Статистика
-    struct Stats {
-        double max_position_error;
-        double max_velocity_error;
-        double max_rotation_error;
-        int total_measurements;
-        std::chrono::time_point<std::chrono::steady_clock> start_time;
-    } stats_;
-    
+    double bias_init_duration_;
+    bool use_manual_bias_;
+
 public:
-    ImuPreintegrationNode() : Node("imu_preintegration_node") {
-        // Загружаем параметры
+    ImuEigenNode() : Node("imu_eigen_node") {
+        // Параметры
         this->declare_parameter("gravity", 9.81);
-        this->declare_parameter("sigma_g", 0.001);
-        this->declare_parameter("sigma_a", 0.01);
-        this->declare_parameter("sigma_bg", 0.0001);
-        this->declare_parameter("sigma_ba", 0.001);
-        this->declare_parameter("output_directory", "/tmp/imu_test");
-        this->declare_parameter("export_enabled", true);
-        this->declare_parameter("publish_rate", 10.0); // Hz
+        this->declare_parameter("bias_init_duration", 2.0);
+        this->declare_parameter("use_manual_bias", false);
+        
+        // Ручные значения bias
+        this->declare_parameter("accel_bias_x", 0.0);
+        this->declare_parameter("accel_bias_y", 0.0);
+        this->declare_parameter("accel_bias_z", 0.0);
         
         gravity_ = this->get_parameter("gravity").as_double();
-        sigma_g_ = this->get_parameter("sigma_g").as_double();
-        sigma_a_ = this->get_parameter("sigma_a").as_double();
-        sigma_bg_ = this->get_parameter("sigma_bg").as_double();
-        sigma_ba_ = this->get_parameter("sigma_ba").as_double();
-        output_directory_ = this->get_parameter("output_directory").as_string();
-        export_enabled_ = this->get_parameter("export_enabled").as_bool();
-        double publish_rate = this->get_parameter("publish_rate").as_double();
+        bias_init_duration_ = this->get_parameter("bias_init_duration").as_double();
+        use_manual_bias_ = this->get_parameter("use_manual_bias").as_bool();
         
-        // Создаем директорию для экспорта
-        if (export_enabled_) {
-            std::filesystem::create_directories(output_directory_);
+        if (use_manual_bias_) {
+            accel_bias_ = Eigen::Vector3d(
+                this->get_parameter("accel_bias_x").as_double(),
+                this->get_parameter("accel_bias_y").as_double(),
+                this->get_parameter("accel_bias_z").as_double()
+            );
+            bias_initialized_ = true;
+            
+            RCLCPP_INFO(this->get_logger(), "Using MANUAL accel bias: [%.4f, %.4f, %.4f]", 
+                accel_bias_.x(), accel_bias_.y(), accel_bias_.z());
+        } else {
+            accel_bias_.setZero();
+            bias_initialized_ = false;
+            RCLCPP_INFO(this->get_logger(), "Using AUTO accel bias calibration (%.1f seconds)", bias_init_duration_);
         }
-        
-        // Инициализация GTSAM
-        auto preint_params = gtsam::PreintegrationParams::MakeSharedU(gravity_);
-        preint_params->accelerometerCovariance = gtsam::Matrix33::Identity() * pow(sigma_a_, 2);
-        preint_params->gyroscopeCovariance = gtsam::Matrix33::Identity() * pow(sigma_g_, 2);
-        preint_params->biasAccCovariance = gtsam::Matrix33::Identity() * pow(sigma_ba_, 2);
-        preint_params->biasOmegaCovariance = gtsam::Matrix33::Identity() * pow(sigma_bg_, 2);
-        
-        current_bias_ = gtsam::imuBias::ConstantBias();
-        preintegrated_ = std::make_shared<gtsam::PreintegratedImuMeasurements>(preint_params, current_bias_);
-        
-        // Подписки и публикаторы
+
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
             "/imu/data", 100,
-            std::bind(&ImuPreintegrationNode::imuCallback, this, std::placeholders::_1)
+            std::bind(&ImuEigenNode::imuCallback, this, std::placeholders::_1)
         );
-        
-        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-            "/imu/relative_pose", 10
-        );
-        
-        velocity_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
-            "/imu/relative_velocity", 10
-        );
-        
-        covariance_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-            "/imu/covariance_visualization", 10
-        );
-        
-        // TF broadcaster
+
+        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/imu/eigen_pose", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
+        position_.setZero();
+        velocity_.setZero();
+        orientation_.setIdentity();
         
-        // Сервисы
-        reset_srv_ = this->create_service<std_srvs::srv::Trigger>(
-            "/imu/reset_preintegration",
-            std::bind(&ImuPreintegrationNode::resetCallback, this, 
-                      std::placeholders::_1, std::placeholders::_2)
-        );
-        
-        export_srv_ = this->create_service<std_srvs::srv::Trigger>(
-            "/imu/export_data",
-            std::bind(&ImuPreintegrationNode::exportCallback, this,
-                      std::placeholders::_1, std::placeholders::_2)
-        );
-        
-        // Таймер для публикации с заданной частотой
-        auto publish_period = std::chrono::duration<double>(1.0 / publish_rate);
-        auto timer = this->create_wall_timer(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(publish_period),
-            std::bind(&ImuPreintegrationNode::publishCallback, this)
-        );
-        
-        last_imu_time_ = 0.0;
+        last_time_ = 0.0;
+        first_message_ = true;
         start_time_ = 0.0;
-        first_imu_received_ = false;
-        measurement_count_ = 0;
-        
-        // Инициализация статистики
-        stats_.max_position_error = 0.0;
-        stats_.max_velocity_error = 0.0;
-        stats_.max_rotation_error = 0.0;
-        stats_.total_measurements = 0;
-        stats_.start_time = std::chrono::steady_clock::now();
-        
-        RCLCPP_INFO(this->get_logger(), "IMU Preintegration Node initialized");
-        RCLCPP_INFO(this->get_logger(), "Parameters:");
-        RCLCPP_INFO(this->get_logger(), "  Gravity: %.3f", gravity_);
-        RCLCPP_INFO(this->get_logger(), "  Sigma G: %.6f", sigma_g_);
-        RCLCPP_INFO(this->get_logger(), "  Sigma A: %.6f", sigma_a_);
-        RCLCPP_INFO(this->get_logger(), "  Sigma BG: %.6f", sigma_bg_);
-        RCLCPP_INFO(this->get_logger(), "  Sigma BA: %.6f", sigma_ba_);
-        RCLCPP_INFO(this->get_logger(), "  Output directory: %s", output_directory_.c_str());
+
+        RCLCPP_INFO(this->get_logger(), "Eigen IMU Node started. Using BUILT-IN orientation from IMU.");
+        RCLCPP_INFO(this->get_logger(), "Waiting for /imu/data...");
     }
-    
-    ~ImuPreintegrationNode() {
-        if (export_enabled_) {
-            exportData();
-        }
-    }
-    
+
 private:
     void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
         double current_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-        
-        if (!first_imu_received_) {
-            last_imu_time_ = current_time;
+
+        if (first_message_) {
+            last_time_ = current_time;
             start_time_ = current_time;
-            first_imu_received_ = true;
-            RCLCPP_INFO(this->get_logger(), "First IMU message received at t=%.3f", current_time);
+            first_message_ = false;
+            if (!use_manual_bias_) {
+                RCLCPP_INFO(this->get_logger(), "First IMU message received. Calibrating accel bias...");
+            }
             return;
         }
-        
-        double dt = current_time - last_imu_time_;
-        
-        // Проверка на разумность dt
+
+        double dt = current_time - last_time_;
         if (dt <= 0.0 || dt > 0.1) {
-            RCLCPP_WARN(this->get_logger(), "Invalid dt: %.6f, skipping measurement", dt);
-            last_imu_time_ = current_time;
+            last_time_ = current_time;
             return;
         }
-        
-        // Извлекаем данные IMU
-        Eigen::Vector3d omega(
-            msg->angular_velocity.x,
-            msg->angular_velocity.y,
-            msg->angular_velocity.z
+
+        // === Читаем ориентацию из IMU (встроенный DSP) ===
+        Eigen::Quaterniond orientation_from_imu(
+            msg->orientation.w,
+            msg->orientation.x,
+            msg->orientation.y,
+            msg->orientation.z
         );
         
-        Eigen::Vector3d accel(
-            msg->linear_acceleration.x,
-            msg->linear_acceleration.y,
-            msg->linear_acceleration.z
-        );
-        
-        // Интегрируем измерение
-        try {
-            preintegrated_->integrateMeasurement(omega, accel, dt);
-            measurement_count_++;
-            stats_.total_measurements++;
-        } catch (const std::exception& e) {
-            RCLCPP_ERROR(this->get_logger(), "Error integrating IMU measurement: %s", e.what());
+        // Проверка валидности кватерниона
+        double q_norm = orientation_from_imu.norm();
+        if (q_norm < 0.1) {
+            RCLCPP_WARN(this->get_logger(), "Invalid orientation from IMU (norm=%.3f), skipping", q_norm);
+            last_time_ = current_time;
+            return;
         }
+        orientation_from_imu.normalize();
+
+        // Читаем ускорение
+        Eigen::Vector3d accel(msg->linear_acceleration.x, 
+                              msg->linear_acceleration.y, 
+                              msg->linear_acceleration.z);
+
+        // === АВТОКАЛИБРОВКА bias акселерометра ===
+        if (!bias_initialized_) {
+            accel_buffer_.push_back(accel);
+            orientation_buffer_.push_back(orientation_from_imu);
+            
+            double elapsed = current_time - start_time_;
+            if (elapsed >= bias_init_duration_) {
+                // В статике: accel = R^T * [0, 0, -g] + bias
+                // bias = accel_avg - R^T * [0, 0, -g]
+                Eigen::Vector3d accel_avg = Eigen::Vector3d::Zero();
+                for (const auto& a : accel_buffer_) accel_avg += a;
+                accel_avg /= accel_buffer_.size();
+                
+                // Усредняем ориентацию (простое среднее кватернионов с нормализацией)
+                Eigen::Quaterniond avg_q(0, 0, 0, 0);
+                for (const auto& q : orientation_buffer_) {
+                    // Учитываем знак кватерниона (q и -q одинаковы)
+                    if (avg_q.coeffs().dot(q.coeffs()) < 0) {
+                        avg_q.coeffs() -= q.coeffs();
+                    } else {
+                        avg_q.coeffs() += q.coeffs();
+                    }
+                }
+                avg_q.normalize();
+                
+                // Вычисляем bias
+                Eigen::Vector3d gravity_world(0.0, 0.0, -gravity_);
+                Eigen::Vector3d gravity_in_body = avg_q.inverse() * gravity_world;
+                accel_bias_ = accel_avg - gravity_in_body;
+                
+                RCLCPP_INFO(this->get_logger(), 
+                    "Calibrated accel bias: [%.4f, %.4f, %.4f] m/s²",
+                    accel_bias_.x(), accel_bias_.y(), accel_bias_.z());
+                RCLCPP_INFO(this->get_logger(), 
+                    "Initial orientation: [w=%.3f, x=%.3f, y=%.3f, z=%.3f]",
+                    avg_q.w(), avg_q.x(), avg_q.y(), avg_q.z());
+                
+                bias_initialized_ = true;
+                accel_buffer_.clear();
+                orientation_buffer_.clear();
+                
+                RCLCPP_INFO(this->get_logger(), "Calibration complete! Starting integration...");
+            }
+            
+            last_time_ = current_time;
+            return;
+        }
+
+        // === ИНТЕГРАЦИЯ ===
+        // 1. Используем ориентацию от IMU напрямую (без интеграции гироскопа!)
+        orientation_ = orientation_from_imu;
+
+        // 2. Вычитаем bias акселерометра
+        accel -= accel_bias_;
+
+        // 3. Компенсация гравитации
+        // Гравитация в мировой системе: [0, 0, -g]
+        // Переводим в систему тела и вычитаем
+        Eigen::Vector3d gravity_world(0.0, 0.0, -gravity_);
+        Eigen::Vector3d gravity_body = orientation_.inverse() * gravity_world;
+        accel -= gravity_body;
+
+        // 4. Переводим ускорение в мировую систему
+        Eigen::Vector3d accel_world = orientation_ * accel;
         
-        last_imu_time_ = current_time;
+        // 5. Интегрирование
+        velocity_ += accel_world * dt;
+        position_ += velocity_ * dt;
+
+        last_time_ = current_time;
+
+        publishTF(msg->header.stamp);
+        publishPose(msg->header.stamp);
     }
-    
-    void publishCallback() {
-        if (!first_imu_received_) return;
-        
-        // Получаем прединтегрированные значения
-        gtsam::Rot3 delta_R = preintegrated_->deltaRij();
-        gtsam::Vector3 delta_v = preintegrated_->deltaVij();
-        gtsam::Vector3 delta_p = preintegrated_->deltaPij();
-        
-        // Получаем ковариацию
-        gtsam::Matrix9 cov = preintegrated_->preintMeasCov();
-        
-        // Публикуем позицию
+
+    void publishTF(const builtin_interfaces::msg::Time &stamp) {
+        geometry_msgs::msg::TransformStamped t;
+        t.header.stamp = stamp;
+        t.header.frame_id = "odom";
+        t.child_frame_id = "imu_base";
+
+        t.transform.translation.x = position_.x();
+        t.transform.translation.y = position_.y();
+        t.transform.translation.z = position_.z();
+
+        t.transform.rotation.x = orientation_.x();
+        t.transform.rotation.y = orientation_.y();
+        t.transform.rotation.z = orientation_.z();
+        t.transform.rotation.w = orientation_.w();
+
+        tf_broadcaster_->sendTransform(t);
+    }
+
+    void publishPose(const builtin_interfaces::msg::Time &stamp) {
         geometry_msgs::msg::PoseStamped pose_msg;
-        pose_msg.header.stamp = this->now();
-        pose_msg.header.frame_id = "imu";
+        pose_msg.header.stamp = stamp;
+        pose_msg.header.frame_id = "odom";
         
-        pose_msg.pose.position.x = delta_p.x();
-        pose_msg.pose.position.y = delta_p.y();
-        pose_msg.pose.position.z = delta_p.z();
+        pose_msg.pose.position.x = position_.x();
+        pose_msg.pose.position.y = position_.y();
+        pose_msg.pose.position.z = position_.z();
         
-        gtsam::Quaternion quat = delta_R.toQuaternion();
-        pose_msg.pose.orientation.x = quat.x();
-        pose_msg.pose.orientation.y = quat.y();
-        pose_msg.pose.orientation.z = quat.z();
-        pose_msg.pose.orientation.w = quat.w();
+        pose_msg.pose.orientation.x = orientation_.x();
+        pose_msg.pose.orientation.y = orientation_.y();
+        pose_msg.pose.orientation.z = orientation_.z();
+        pose_msg.pose.orientation.w = orientation_.w();
         
         pose_pub_->publish(pose_msg);
-        
-        // Публикуем скорость
-        geometry_msgs::msg::TwistStamped twist_msg;
-        twist_msg.header.stamp = this->now();
-        twist_msg.header.frame_id = "imu";
-        
-        twist_msg.twist.linear.x = delta_v.x();
-        twist_msg.twist.linear.y = delta_v.y();
-        twist_msg.twist.linear.z = delta_v.z();
-        
-        velocity_pub_->publish(twist_msg);
-        
-        // Публикуем TF
-        geometry_msgs::msg::TransformStamped transform_stamped;
-        transform_stamped.header.stamp = this->now();
-        transform_stamped.header.frame_id = "imu";
-        transform_stamped.child_frame_id = "imu_preintegrated";
-        
-        transform_stamped.transform.translation.x = delta_p.x();
-        transform_stamped.transform.translation.y = delta_p.y();
-        transform_stamped.transform.translation.z = delta_p.z();
-        
-        transform_stamped.transform.rotation.x = quat.x();
-        transform_stamped.transform.rotation.y = quat.y();
-        transform_stamped.transform.rotation.z = quat.z();
-        transform_stamped.transform.rotation.w = quat.w();
-        
-        tf_broadcaster_->sendTransform(transform_stamped);
-        
-        // Логируем статистику каждые 10 секунд
-        static double last_log_time = 0.0;
-        double current_time = this->now().seconds();
-        if (current_time - last_log_time > 10.0) {
-            double elapsed = current_time - start_time_;
+
+        static double last_log = 0;
+        double now = stamp.sec + stamp.nanosec * 1e-9;
+        if (now - last_log > 2.0) {
             RCLCPP_INFO(this->get_logger(), 
-                "=== IMU Preintegration Stats (t=%.1fs) ===\n"
-                "Measurements: %d\n"
-                "Position: [%.3f, %.3f, %.3f] m\n"
-                "Velocity: [%.3f, %.3f, %.3f] m/s\n"
-                "Rotation: [%.3f, %.3f, %.3f] rad\n"
-                "Position uncertainty: %.3f m\n"
-                "Velocity uncertainty: %.3f m/s",
-                elapsed,
-                measurement_count_,
-                delta_p.x(), delta_p.y(), delta_p.z(),
-                delta_v.x(), delta_v.y(), delta_v.z(),
-                delta_R.xyz().x(), delta_R.xyz().y(), delta_R.xyz().z(),
-                sqrt(cov(6,6) + cov(7,7) + cov(8,8)),
-                sqrt(cov(3,3) + cov(4,4) + cov(5,5))
+                "Pos: [%.3f, %.3f, %.3f] | Vel: [%.3f, %.3f, %.3f]",
+                position_.x(), position_.y(), position_.z(),
+                velocity_.x(), velocity_.y(), velocity_.z()
             );
-            last_log_time = current_time;
+            last_log = now;
         }
-    }
-    
-    void resetCallback(
-        const std_srvs::srv::Trigger::Request::SharedPtr,
-        std_srvs::srv::Trigger::Response::SharedPtr response) 
-    {
-        // Сохраняем данные перед сбросом
-        if (export_enabled_) {
-            exportData();
-        }
-        
-        preintegrated_->resetIntegration();
-        measurement_count_ = 0;
-        
-        RCLCPP_INFO(this->get_logger(), "Preintegration reset");
-        response->success = true;
-        response->message = "Preintegration reset successfully";
-    }
-    
-    void exportCallback(
-        const std_srvs::srv::Trigger::Request::SharedPtr,
-        std_srvs::srv::Trigger::Response::SharedPtr response) 
-    {
-        exportData();
-        response->success = true;
-        response->message = "Data exported to " + output_directory_;
-    }
-    
-    void exportData() {
-        if (!export_enabled_) return;
-        
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
-        
-        std::string filename = output_directory_ + "/imu_preintegration_" + ss.str() + ".csv";
-        std::ofstream file(filename);
-        
-        if (!file.is_open()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open file: %s", filename.c_str());
-            return;
-        }
-        
-        // Заголовки
-        file << "timestamp,position_x,position_y,position_z,"
-             << "velocity_x,velocity_y,velocity_z,"
-             << "rotation_x,rotation_y,rotation_z,rotation_w,"
-             << "covariance_position,covariance_velocity,covariance_rotation\n";
-        
-        // Данные
-        gtsam::Rot3 delta_R = preintegrated_->deltaRij();
-        gtsam::Vector3 delta_v = preintegrated_->deltaVij();
-        gtsam::Vector3 delta_p = preintegrated_->deltaPij();
-        gtsam::Matrix9 cov = preintegrated_->preintMeasCov();
-        gtsam::Quaternion quat = delta_R.toQuaternion();
-        
-        file << this->now().seconds() << ","
-             << delta_p.x() << "," << delta_p.y() << "," << delta_p.z() << ","
-             << delta_v.x() << "," << delta_v.y() << "," << delta_v.z() << ","
-             << quat.x() << "," << quat.y() << "," << quat.z() << "," << quat.w() << ","
-             << sqrt(cov(6,6) + cov(7,7) + cov(8,8)) << ","
-             << sqrt(cov(3,3) + cov(4,4) + cov(5,5)) << ","
-             << sqrt(cov(0,0) + cov(1,1) + cov(2,2)) << "\n";
-        
-        file.close();
-        
-        RCLCPP_INFO(this->get_logger(), "Data exported to: %s", filename.c_str());
     }
 };
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<ImuPreintegrationNode>());
+    rclcpp::spin(std::make_shared<ImuEigenNode>());
     rclcpp::shutdown();
     return 0;
 }
